@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 import torch
 from botorch.acquisition.multi_objective import qLogExpectedHypervolumeImprovement
+from botorch.acquisition import qLogExpectedImprovement
 from botorch.models import SingleTaskGP
 from botorch.models.model_list_gp_regression import ModelListGP
 from botorch.models.transforms.input import Normalize
@@ -302,16 +303,183 @@ class MultiObjectiveBOPipeline:
 
     def pareto_front(self) -> pd.DataFrame:
         """Currently observed Pareto-optimal rows, in original units."""
-        complete = self.df.dropna(subset=list(self.objective_cols))
+        complete = self.df.dropna(subset=list(self.objective_cols)).reset_index(drop=True)
         Y_raw = complete[list(self.objective_cols)].values.astype(float)
         Y_int = self._to_internal_objective(Y_raw)  # maximize-oriented
-        is_efficient = np.ones(len(Y_int), dtype=bool)
-        for i, y in enumerate(Y_int):
-            if is_efficient[i]:
-                dominated = np.all(Y_int >= y, axis=1) & np.any(Y_int > y, axis=1)
-                dominated[i] = False
-                is_efficient[dominated] = False
+
+        n = len(Y_int)
+        is_efficient = np.ones(n, dtype=bool)
+        for i in range(n):
+            y = Y_int[i]
+            # rows that dominate row i: >= y in every objective, > y in at least one
+            dominates_i = np.all(Y_int >= y, axis=1) & np.any(Y_int > y, axis=1)
+            dominates_i[i] = False
+            if dominates_i.any():
+                is_efficient[i] = False  # row i is dominated by something else -> drop it
         return complete.loc[is_efficient].reset_index(drop=True)
+
+
+@dataclass
+class SingleObjectiveBOPipeline:
+    """Single-objective counterpart of MultiObjectiveBOPipeline: optimizes
+    ONE of the objective columns using Expected Improvement.
+
+    Shares the same CSV schema as MultiObjectiveBOPipeline (all objective
+    columns present), so you can freely switch between single- and
+    multi-objective mode on the same dataset. Rows only need the chosen
+    `objective_col` filled in to be usable here (other EIC columns may be
+    NaN); such partially-measured rows are automatically skipped by the
+    multi-objective pipeline, which requires all three.
+    """
+
+    csv_path: str
+    objective_col: str
+    param_cols: Sequence[str] = field(default_factory=lambda: PARAM_COLS)
+    param_bounds: dict = field(default_factory=lambda: PARAM_BOUNDS)
+    maximize: bool = True
+    log_transform: bool = True
+
+    def __post_init__(self):
+        self.df = load_dataset(self.csv_path)
+        self._validate()
+        self.bounds = torch.tensor(
+            [self.param_bounds[c] for c in self.param_cols], dtype=torch.float64
+        ).T  # shape (2, d)
+        self.model: SingleTaskGP | None = None
+
+    def _validate(self):
+        missing = [c for c in list(self.param_cols) + [self.objective_col] if c not in self.df.columns]
+        if missing:
+            raise ValueError(f"CSV is missing expected columns: {missing}")
+
+    # ---- tensors -----------------------------------------------------
+
+    def _train_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (X, Y): X normalized to [0,1]^d; Y transformed so that
+        HIGHER IS ALWAYS BETTER (sign-flipped if maximize=False, log10 if
+        log_transform=True). Standardization for GP fitting is handled
+        internally by the model's Standardize() outcome transform."""
+        complete = self.df.dropna(subset=[self.objective_col])
+        if len(complete) < 2:
+            raise ValueError(
+                f"Need at least 2 rows with a measured '{self.objective_col}' value to fit a model."
+            )
+
+        X_raw = torch.tensor(complete[list(self.param_cols)].values, dtype=torch.float64)
+        X = (X_raw - self.bounds[0]) / (self.bounds[1] - self.bounds[0])
+
+        y = complete[self.objective_col].values.astype(float)
+        if self.log_transform:
+            y = np.log10(y + LOG_EPS)
+        if not self.maximize:
+            y = -y
+        Y = torch.tensor(y, dtype=torch.float64).unsqueeze(-1)
+        return X, Y
+
+    # ---- model ---------------------------------------------------------
+
+    def fit(self) -> SingleTaskGP:
+        """Fit a SingleTaskGP with an RBF (ARD) kernel on the chosen objective."""
+        X, Y = self._train_tensors()
+        d = X.shape[-1]
+        covar = ScaleKernel(RBFKernel(ard_num_dims=d))
+        gp = SingleTaskGP(
+            X,
+            Y,
+            covar_module=covar,
+            input_transform=Normalize(d=d),
+            outcome_transform=Standardize(m=1),
+        )
+        mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+        fit_gpytorch_mll(mll)
+        self.model = gp
+        self._train_Y = Y  # cache for incumbent best_f
+        return self.model
+
+    # ---- acquisition / suggestion --------------------------------------
+
+    def suggest(
+        self,
+        n: int = 5,
+        num_restarts: int = 10,
+        raw_samples: int = 512,
+    ) -> pd.DataFrame:
+        """Optimize qLogExpectedImprovement for a batch of `n` candidates.
+        Returns a DataFrame in the ORIGINAL (unnormalized) parameter units.
+        All objective columns (not just the active one) are included, left
+        as NaN, so the candidates file has the same shape as the
+        multi-objective one and can be ingested into the same CSV."""
+        if self.model is None:
+            self.fit()
+
+        # qLogExpectedImprovement: numerically-stabilized (log-space)
+        # formulation of EI -- same acquisition semantics as classic EI, but
+        # recommended by BoTorch to avoid vanishing-gradient issues,
+        # mirroring the qLogEHVI choice used for the multi-objective mode.
+        best_f = self._train_Y.max().item()
+        acq = qLogExpectedImprovement(model=self.model, best_f=best_f)
+
+        unit_bounds = torch.stack(
+            [torch.zeros(len(self.param_cols), dtype=torch.float64),
+             torch.ones(len(self.param_cols), dtype=torch.float64)]
+        )
+        candidates_unit, _ = optimize_acqf(
+            acq_function=acq,
+            bounds=unit_bounds,
+            q=n,
+            num_restarts=num_restarts,
+            raw_samples=raw_samples,
+            sequential=True,
+        )
+        candidates = unnormalize(candidates_unit, self.bounds)
+        df_cand = pd.DataFrame(candidates.detach().numpy(), columns=list(self.param_cols))
+        for c in OBJECTIVE_COLS:
+            df_cand[c] = np.nan  # to be filled in after the physical measurement
+        return df_cand.round(4)
+
+    # ---- ingesting new measurements -------------------------------------
+
+    def write_candidates(self, df_cand: pd.DataFrame, out_path: str) -> str:
+        df_cand.to_csv(out_path, sep=CSV_SEPARATOR, index=False)
+        return out_path
+
+    def ingest(self, filled_csv_path: str) -> pd.DataFrame:
+        """Read a candidates CSV with at least the active objective column
+        filled in (other EIC columns may be left blank if not measured),
+        append it to the main dataset with fresh index numbers, and persist
+        the CSV. Does NOT refit automatically."""
+        new_rows = pd.read_csv(filled_csv_path, sep=CSV_SEPARATOR)
+        if self.objective_col not in new_rows.columns:
+            raise ValueError(f"Candidates file is missing the objective column: {self.objective_col}")
+        if new_rows[self.objective_col].isna().any():
+            raise ValueError(
+                f"Some '{self.objective_col}' values are still empty (NaN) in "
+                f"'{filled_csv_path}'. Fill in all measured values for this objective "
+                "before ingesting. (Other EIC columns may be left blank if not measured.)"
+            )
+
+        next_idx = int(self.df[INDEX_COL].max()) + 1
+        present_obj_cols = [c for c in OBJECTIVE_COLS if c in new_rows.columns]
+        new_rows = new_rows[list(self.param_cols) + present_obj_cols].copy()
+        new_rows.insert(0, INDEX_COL, range(next_idx, next_idx + len(new_rows)))
+
+        self.df = pd.concat([self.df, new_rows], ignore_index=True)
+        self.df.to_csv(self.csv_path, sep=CSV_SEPARATOR, index=False)
+        return self.df
+
+    def refit_and_suggest(self, n: int = 5) -> pd.DataFrame:
+        self.fit()
+        return self.suggest(n=n)
+
+    # ---- reporting -------------------------------------------------------
+
+    def best_observed(self) -> pd.DataFrame:
+        """The single best-measured row for this objective, in original units."""
+        complete = self.df.dropna(subset=[self.objective_col])
+        if len(complete) == 0:
+            raise ValueError(f"No measurements yet for '{self.objective_col}'.")
+        idx = complete[self.objective_col].idxmax() if self.maximize else complete[self.objective_col].idxmin()
+        return complete.loc[[idx]].reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------
@@ -326,9 +494,22 @@ def _default_candidates_path(csv_path: str) -> str:
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--csv", default=None, help="Path to the main measurement CSV.")
+    p.add_argument(
+        "--mode", choices=["multi", "single"], default="multi",
+        help="'multi' (default): 3-objective qLogEHVI. 'single': 1-objective qLogEI "
+             "on the column given by --objective.",
+    )
+    p.add_argument(
+        "--objective", choices=OBJECTIVE_COLS, default=None,
+        help="Required with --mode single: which objective column to optimize.",
+    )
+    p.add_argument(
+        "--minimize", action="store_true",
+        help="Only used with --mode single: minimize --objective instead of maximizing it.",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("suggest", help="Fit GPs on current data and propose new candidates.")
+    s = sub.add_parser("suggest", help="Fit GP(s) on current data and propose new candidates.")
     s.add_argument("--n", type=int, default=5)
     s.add_argument("--out", default=None, help="Where to write the candidates CSV.")
 
@@ -336,14 +517,28 @@ def main():
     i.add_argument("--file", required=True, help="Candidates CSV with objective columns filled in.")
     i.add_argument("--suggest-next", type=int, default=0, help="If >0, immediately refit and suggest N more.")
 
-    r = sub.add_parser("pareto", help="Show the current Pareto-optimal measured rows.")
+    sub.add_parser("pareto", help="[multi mode] Show the current Pareto-optimal measured rows.")
+    sub.add_parser("best", help="[single mode] Show the current best-measured row for --objective.")
 
     args = p.parse_args()
     csv_path = args.csv or os.environ.get("BO_CSV_PATH")
     if not csv_path:
         raise SystemExit("Provide --csv path/to/measurements.csv")
 
-    pipe = MultiObjectiveBOPipeline(csv_path=csv_path)
+    if args.mode == "multi":
+        if args.command == "best":
+            raise SystemExit("'best' is only valid with --mode single. Use 'pareto' for --mode multi.")
+        pipe = MultiObjectiveBOPipeline(csv_path=csv_path)
+    else:
+        if args.command == "pareto":
+            raise SystemExit("'pareto' is only valid with --mode multi. Use 'best' for --mode single.")
+        if not args.objective:
+            raise SystemExit(
+                "--mode single requires --objective, one of: " + ", ".join(OBJECTIVE_COLS)
+            )
+        pipe = SingleObjectiveBOPipeline(
+            csv_path=csv_path, objective_col=args.objective, maximize=not args.minimize
+        )
 
     if args.command == "suggest":
         df_cand = pipe.suggest(n=args.n)
@@ -363,7 +558,19 @@ def main():
             print(df_cand.to_string(index=False))
 
     elif args.command == "pareto":
-        print(pipe.pareto_front().to_string(index=False))
+        front = pipe.pareto_front()
+        # Objective values here can genuinely span ~1e-7 to ~1 (raw EIC
+        # intensities). Plain to_string() rounds to 6 decimals and makes
+        # small-but-real values print as 0.000000, so use general/scientific
+        # formatting instead -- this changes only how numbers are displayed,
+        # not any value used internally by the model.
+        with pd.option_context("display.float_format", lambda x: f"{x:.4g}"):
+            print(front.to_string(index=False))
+
+    elif args.command == "best":
+        row = pipe.best_observed()
+        with pd.option_context("display.float_format", lambda x: f"{x:.4g}"):
+            print(row.to_string(index=False))
 
 
 if __name__ == "__main__":
