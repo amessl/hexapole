@@ -79,8 +79,7 @@ next_candidates = pipe.refit_and_suggest(n=5)
 
 ## Additional Info
 
-- **Parameter bounds** (`PARAM_BOUNDS` in the config section): inferred from
-  the observed range in the initial 100 samples — `[-120, 0]` for the 12
+- **Parameter bounds** (`PARAM_BOUNDS` in the config section): `[-120, 0]` for the 12
   stage/output channels and `[0, 400]` for `RF`.
 - **Objective direction** (`MAXIMIZE_OBJECTIVE`): all three EIC channels
   default to **maximize**. If any of them is something to be
